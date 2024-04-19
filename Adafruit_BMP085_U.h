@@ -82,6 +82,10 @@ typedef struct {
 
 /*!
  * @brief Class that stores state and functions for interacting with BMP183
+ *
+ * Using the BMP085 requires delays to read pressure data from the sensor. If
+ * your project cannot have calls to delay, then you should use the async
+ * portion of the class.
  */
 class Adafruit_BMP085_Unified : public Adafruit_Sensor {
 public:
@@ -94,16 +98,66 @@ public:
    * @return Returns true if successful
    */
   bool begin(bmp085_mode_t mode = BMP085_MODE_ULTRAHIGHRES);
+
+  /*!
+   * @brief Update the BMP085 asynchronously
+   *
+   * A call to this function should be made once every loop. The rest of the
+   * program must not contain any calls to delay for this to function correctly.
+   */
+  void updateAsync();
+
+  /*!
+   * @brief Check if the async fetch of temperature is ready
+   * @return Returns true if the temperature value is ready
+   *
+   * When the temperature value is ready, this function will return true until
+   * getTemperatureAsync() is called.
+   */
+  bool isTemperatureReadyAsync();
+  /*!
+   * @brief Check if the async fetch of pressure is ready
+   * @return Returns true if the pressure value is ready
+   *
+   * When the pressure value is ready, this function will return true until
+   * getPressureAsync() is called.
+   */
+  bool isPressureReadyAsync();
+  /*!
+   * @brief Get the last read async temperature value
+   * @return Returns the last read temperature value
+   */
+  float getTemperatureAsync();
+  /*!
+   * @brief Get the last read async pressure value in kPa
+   * @return Returns the last read pressure value in kPa
+   */
+  float getPressureAsync();
+  /*!
+   * @brief Request temperature to be fetched
+   */
+  void fetchTemperatureAsync();
+  /*!
+   * @brief Request pressure to be fetched
+   */
+  void fetchPressureAsync();
+  /*!
+   * @brief Get the pressure event asynchronously
+   * @param event Event to populate the pressure with
+   * @return true if the event is ready
+   */
+  bool getEventAsync(sensors_event_t *);
+
   /*!
    * @brief Gets the temperature over I2C from the BMP085
    * @param temp Temperature
-   * @return Returns the temperature
+   * @return Returns the temperature in C
    */
   void getTemperature(float *temp);
   /*!
    * @brief Gets the pressure over I2C from the BMP085
    * @param pressure Pressure
-   * @return Returns the pressure
+   * @return Returns the pressure in kPa
    */
   void getPressure(float *pressure);
   /*!
@@ -148,6 +202,8 @@ public:
 
 private:
   int32_t computeB5(int32_t ut);
+  void calculatePressure(int32_t ut, int32_t up, float *pressure);
+  void calculateTemperature(int32_t ut, float *temp);
   int32_t _sensorID;
 };
 

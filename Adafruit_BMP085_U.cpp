@@ -47,6 +47,22 @@ static bmp085_calib_data
     _bmp085_coeffs; // Last read accelerometer data will be available here
 static uint8_t _bmp085Mode;
 
+enum AsyncBMP085State {
+  WAITING_TEMP,
+  WAITING_PRES,
+  READY,
+};
+
+static AsyncBMP085State state(READY);
+static uint32_t delay_till;
+static int32_t raw_pressure, raw_temp;
+static bool raw_pressure_ready(false), raw_temp_ready(false);
+
+static float pressure, temp;
+static bool pressure_ready(false), temp_ready(false);
+
+static bool wants_pressure(false), wants_temp(false);
+
 #define BMP085_USE_DATASHEET_VALS                                              \
   (0) //!< Set to 1 for sanity check, when true, will use values from datasheet
 
@@ -177,6 +193,24 @@ static void readRawTemperature(int32_t *temperature) {
 #endif
 }
 
+static int startReadRawTemperature() {
+#if BMP085_USE_DATASHEET_VALS
+  return 0;
+#else
+  writeCommand(BMP085_REGISTER_CONTROL, BMP085_REGISTER_READTEMPCMD);
+  return 5;
+#endif
+}
+static void finishReadRawTemperature(int32_t *temperature) {
+#if BMP085_USE_DATASHEET_VALS
+  *temperature = 27898;
+#else
+  uint16_t t;
+  read16(BMP085_REGISTER_TEMPDATA, &t);
+  *temperature = t;
+#endif
+}
+
 /**************************************************************************/
 /*!
 
@@ -216,6 +250,99 @@ static void readRawPressure(int32_t *pressure) {
 
   *pressure = p32;
 #endif
+}
+
+static int startReadRawPressure() {
+#if BMP085_USE_DATASHEET_VALS
+  return 0;
+#else
+  writeCommand(BMP085_REGISTER_CONTROL,
+               BMP085_REGISTER_READPRESSURECMD + (_bmp085Mode << 6));
+  switch (_bmp085Mode) {
+  case BMP085_MODE_ULTRALOWPOWER:
+    return 5;
+  case BMP085_MODE_STANDARD:
+    return 8;
+  case BMP085_MODE_HIGHRES:
+    return 14;
+  case BMP085_MODE_ULTRAHIGHRES:
+  default:
+    return 26;
+  }
+#endif
+}
+static void finishReadRawPressure(int32_t *pressure) {
+#if BMP085_USE_DATASHEET_VALS
+  *pressure = 23843;
+#else
+  uint8_t p8;
+  uint16_t p16;
+  int32_t p32;
+
+  read16(BMP085_REGISTER_PRESSUREDATA, &p16);
+  p32 = (uint32_t)p16 << 8;
+  read8(BMP085_REGISTER_PRESSUREDATA + 2, &p8);
+  p32 += p8;
+  p32 >>= (8 - _bmp085Mode);
+
+  *pressure = p32;
+#endif
+}
+
+void Adafruit_BMP085_Unified::calculatePressure(int32_t ut, int32_t up,
+                                                float *pressure) {
+  int32_t compp = 0;
+  int32_t x1, x2, b5, b6, x3, b3, p;
+  uint32_t b4, b7;
+
+  /* Temperature compensation */
+  b5 = computeB5(ut);
+
+  /* Pressure compensation */
+  b6 = b5 - 4000;
+  x1 = (_bmp085_coeffs.b2 * ((b6 * b6) >> 12)) >> 11;
+  x2 = (_bmp085_coeffs.ac2 * b6) >> 11;
+  x3 = x1 + x2;
+  b3 = (((((int32_t)_bmp085_coeffs.ac1) * 4 + x3) << _bmp085Mode) + 2) >> 2;
+  x1 = (_bmp085_coeffs.ac3 * b6) >> 13;
+  x2 = (_bmp085_coeffs.b1 * ((b6 * b6) >> 12)) >> 16;
+  x3 = ((x1 + x2) + 2) >> 2;
+  b4 = (_bmp085_coeffs.ac4 * (uint32_t)(x3 + 32768)) >> 15;
+  b7 = ((uint32_t)(up - b3) * (50000 >> _bmp085Mode));
+
+  if (b7 < 0x80000000) {
+    p = (b7 << 1) / b4;
+  } else {
+    p = (b7 / b4) << 1;
+  }
+
+  x1 = (p >> 8) * (p >> 8);
+  x1 = (x1 * 3038) >> 16;
+  x2 = (-7357 * p) >> 16;
+  compp = p + ((x1 + x2 + 3791) >> 4);
+
+  /* Assign compensated pressure value */
+  *pressure = compp;
+}
+
+void Adafruit_BMP085_Unified::calculateTemperature(int32_t ut, float *temp) {
+  int32_t B5; // following ds convention
+  float t;
+
+#if BMP085_USE_DATASHEET_VALS
+  // use datasheet numbers!
+  ut = 27898;
+  _bmp085_coeffs.ac6 = 23153;
+  _bmp085_coeffs.ac5 = 32757;
+  _bmp085_coeffs.mc = -8711;
+  _bmp085_coeffs.md = 2868;
+#endif
+
+  B5 = computeB5(ut);
+  t = (B5 + 8) >> 4;
+  t /= 10;
+
+  *temp = t;
 }
 
 /**************************************************************************/
@@ -278,48 +405,117 @@ bool Adafruit_BMP085_Unified::begin(bmp085_mode_t mode) {
   return true;
 }
 
+void Adafruit_BMP085_Unified::updateAsync() {
+  uint32_t now;
+  switch (state) {
+  case WAITING_PRES:
+    now = millis();
+    if ((int32_t)(delay_till - now) <= 0) {
+      finishReadRawPressure(&raw_pressure);
+      raw_pressure_ready = true;
+      state = READY;
+      updateAsync();
+      return;
+    }
+    break;
+  case WAITING_TEMP:
+    now = millis();
+    if ((int32_t)(delay_till - now) <= 0) {
+      finishReadRawTemperature(&raw_temp);
+      raw_temp_ready = true;
+      state = READY;
+      updateAsync();
+      return;
+    }
+    break;
+  case READY:
+    if (wants_temp && !temp_ready) {
+      if (!raw_temp_ready) {
+        uint32_t wait = startReadRawTemperature();
+        delay_till = millis() + wait;
+        state = WAITING_TEMP;
+        return;
+      }
+
+      // Compute Temperature
+      calculateTemperature(raw_temp, &temp);
+
+      temp_ready = true;
+      wants_temp = false;
+      if (!wants_pressure) {
+        // Only unset raw_temp_ready if pressure is not wanted so that pressure
+        // can be calculated
+        raw_temp_ready = false;
+      }
+    }
+
+    if (wants_pressure && !pressure_ready) {
+      if (!raw_temp_ready) {
+        uint32_t wait = startReadRawTemperature();
+        delay_till = millis() + wait;
+        state = WAITING_TEMP;
+        return;
+      }
+      if (!raw_pressure_ready) {
+        uint32_t wait = startReadRawPressure();
+        delay_till = millis() + wait;
+        state = WAITING_PRES;
+        return;
+      }
+
+      // Compute Temperature
+      calculatePressure(raw_temp, raw_pressure, &pressure);
+
+      pressure_ready = true;
+      wants_pressure = false;
+      raw_pressure_ready = false;
+      raw_temp_ready = false;
+    }
+    break;
+  }
+}
+bool Adafruit_BMP085_Unified::isTemperatureReadyAsync() { return temp_ready; }
+bool Adafruit_BMP085_Unified::isPressureReadyAsync() { return pressure_ready; }
+float Adafruit_BMP085_Unified::getPressureAsync() {
+  pressure_ready = false;
+  return pressure;
+}
+float Adafruit_BMP085_Unified::getTemperatureAsync() {
+  temp_ready = false;
+  return temp;
+}
+void Adafruit_BMP085_Unified::fetchTemperatureAsync() { wants_temp = true; }
+void Adafruit_BMP085_Unified::fetchPressureAsync() { wants_pressure = true; }
+
+bool Adafruit_BMP085_Unified::getEventAsync(sensors_event_t *event) {
+  if (isPressureReadyAsync()) {
+    /* Clear the event */
+    memset(event, 0, sizeof(sensors_event_t));
+
+    float pressure_kPa = getPressureAsync();
+
+    event->version = sizeof(sensors_event_t);
+    event->sensor_id = _sensorID;
+    event->type = SENSOR_TYPE_PRESSURE;
+    event->timestamp = 0;
+    event->pressure = pressure_kPa / 100.0F;
+    return true;
+  }
+
+  fetchPressureAsync();
+  return false;
+}
+
 /**************************************************************************/
 /*!
     @brief  Gets the compensated pressure level in kPa
 */
 /**************************************************************************/
 void Adafruit_BMP085_Unified::getPressure(float *pressure) {
-  int32_t ut = 0, up = 0, compp = 0;
-  int32_t x1, x2, b5, b6, x3, b3, p;
-  uint32_t b4, b7;
-
-  /* Get the raw pressure and temperature values */
+  int32_t ut, up;
   readRawTemperature(&ut);
   readRawPressure(&up);
-
-  /* Temperature compensation */
-  b5 = computeB5(ut);
-
-  /* Pressure compensation */
-  b6 = b5 - 4000;
-  x1 = (_bmp085_coeffs.b2 * ((b6 * b6) >> 12)) >> 11;
-  x2 = (_bmp085_coeffs.ac2 * b6) >> 11;
-  x3 = x1 + x2;
-  b3 = (((((int32_t)_bmp085_coeffs.ac1) * 4 + x3) << _bmp085Mode) + 2) >> 2;
-  x1 = (_bmp085_coeffs.ac3 * b6) >> 13;
-  x2 = (_bmp085_coeffs.b1 * ((b6 * b6) >> 12)) >> 16;
-  x3 = ((x1 + x2) + 2) >> 2;
-  b4 = (_bmp085_coeffs.ac4 * (uint32_t)(x3 + 32768)) >> 15;
-  b7 = ((uint32_t)(up - b3) * (50000 >> _bmp085Mode));
-
-  if (b7 < 0x80000000) {
-    p = (b7 << 1) / b4;
-  } else {
-    p = (b7 / b4) << 1;
-  }
-
-  x1 = (p >> 8) * (p >> 8);
-  x1 = (x1 * 3038) >> 16;
-  x2 = (-7357 * p) >> 16;
-  compp = p + ((x1 + x2 + 3791) >> 4);
-
-  /* Assign compensated pressure value */
-  *pressure = compp;
+  calculatePressure(ut, up, pressure);
 }
 
 /**************************************************************************/
@@ -328,25 +524,9 @@ void Adafruit_BMP085_Unified::getPressure(float *pressure) {
 */
 /**************************************************************************/
 void Adafruit_BMP085_Unified::getTemperature(float *temp) {
-  int32_t UT, B5; // following ds convention
-  float t;
-
-  readRawTemperature(&UT);
-
-#if BMP085_USE_DATASHEET_VALS
-  // use datasheet numbers!
-  UT = 27898;
-  _bmp085_coeffs.ac6 = 23153;
-  _bmp085_coeffs.ac5 = 32757;
-  _bmp085_coeffs.mc = -8711;
-  _bmp085_coeffs.md = 2868;
-#endif
-
-  B5 = computeB5(UT);
-  t = (B5 + 8) >> 4;
-  t /= 10;
-
-  *temp = t;
+  int32_t ut;
+  readRawTemperature(&ut);
+  calculateTemperature(ut, temp);
 }
 
 /**************************************************************************/
